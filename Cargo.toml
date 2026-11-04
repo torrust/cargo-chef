@@ -1,6 +1,6 @@
 [package]
 name = "torrust-cargo-chef"
-version = "0.1.78"
+version = "0.1.79"
 authors = [
     "Luca Palmieri <lpalmieri@truelayer.com>",
     "Jose Celano <josecelano@gmail.com>",

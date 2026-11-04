@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `--external-only` flag to `cargo chef prepare` to strip all `path = "..."` dependency entries from the recipe (including intra-workspace path deps and any other local path deps), enabling a stable Docker cache layer for third-party dependencies that is not invalidated by workspace-internal changes ([#359](https://github.com/LukeMathWalker/cargo-chef/issues/359))
 
+### Fixed
+
+- `cargo chef prepare --external-only` now also prunes, in every manifest, the `[features]` entries that name a stripped path dependency (`dep:name`, `name`, `name/feature` and `name?/feature`). Before, an optional workspace dependency behind a feature (for example `testing = ["dep:internal"]`) left a feature that named a dependency that was no longer listed, so cargo rejected the skeleton manifest and `cargo chef cook` exited with status 101 ("feature `testing` includes `dep:internal`, but `internal` is not listed as a dependency"). The feature itself is kept, possibly empty.
+
 ## [0.1.77](https://github.com/LukeMathWalker/cargo-chef/compare/v0.1.76...v0.1.77) - 2026-03-03
 
 ### Fixed

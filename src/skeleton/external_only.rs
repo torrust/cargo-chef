@@ -18,7 +18,16 @@
 //!    intra-workspace path deps and any other local path deps (e.g. out-of-tree
 //!    crates referenced by absolute or relative path).
 //!
-//! 2. Removing all local (no-`source`) package entries from the lock file.
+//! 2. Pruning, in every manifest, the `[features]` entries that name a removed
+//!    dependency: `dep:name`, `name` (the implicit feature of an optional
+//!    dependency), `name/feature` and `name?/feature`.  Cargo rejects a
+//!    manifest whose feature names a dependency that is not listed, so without
+//!    this step an optional path dependency behind a feature (for example
+//!    `testing = ["dep:internal"]`) makes `cargo chef cook` fail.  The feature
+//!    itself is kept, possibly empty, so entries of other features that refer
+//!    to it stay valid.
+//!
+//! 3. Removing all local (no-`source`) package entries from the lock file.
 //!    External packages always carry a `source` field (e.g.
 //!    `"registry+https://github.com/rust-lang/crates.io-index"`); local
 //!    workspace members do not.  Removing them makes the recipe immune to
@@ -120,21 +129,28 @@ fn strip_from_manifest_contents(
         .context("failed to parse manifest TOML during path-dep stripping")?;
 
     // Top-level [dependencies], [dev-dependencies], [build-dependencies]
-    strip_path_deps_from_value(&mut value, workspace_path_dep_names);
+    let mut removed = strip_path_deps_from_value(&mut value, workspace_path_dep_names);
 
     // [target.'cfg(...)'.{dependencies,dev-dependencies,build-dependencies}]
     if let Some(targets) = value.get_mut("target") {
         if let Some(targets_table) = targets.as_table_mut() {
             for (_, target_cfg) in targets_table.iter_mut() {
-                strip_path_deps_from_value(target_cfg, workspace_path_dep_names);
+                removed.extend(strip_path_deps_from_value(
+                    target_cfg,
+                    workspace_path_dep_names,
+                ));
             }
         }
     }
 
-    // [workspace.dependencies] (workspace inheritance, rust 1.64+)
+    // [workspace.dependencies] (workspace inheritance, rust 1.64+). Its names
+    // are not dependencies of a package, so no feature can refer to them.
     if let Some(workspace) = value.get_mut("workspace") {
         strip_path_deps_from_value(workspace, workspace_path_dep_names);
     }
+
+    // [features] entries must not name a dependency that was just removed.
+    prune_features(&mut value, &removed);
 
     toml::to_string(&value)
         .context("failed to re-serialise manifest TOML after stripping path deps")
@@ -142,14 +158,21 @@ fn strip_from_manifest_contents(
 
 /// Remove every dependency entry that has a `path` field, or whose name
 /// appears in `workspace_path_dep_names` with `{ workspace = true }`, from
-/// the given `toml::Value`'s dependency sections.
-fn strip_path_deps_from_value(value: &mut toml::Value, workspace_path_dep_names: &HashSet<String>) {
+/// the given `toml::Value`'s dependency sections.  Returns the names (the keys
+/// of the dependency tables, which is what a feature refers to) that were
+/// removed.
+fn strip_path_deps_from_value(
+    value: &mut toml::Value,
+    workspace_path_dep_names: &HashSet<String>,
+) -> HashSet<String> {
+    let mut removed: HashSet<String> = HashSet::new();
     for section in DEP_SECTIONS {
         if let Some(deps) = value.get_mut(section) {
             if let Some(table) = deps.as_table_mut() {
                 table.retain(|name, dep_spec| {
                     // Remove direct path deps.
                     if dep_spec.get("path").is_some() {
+                        removed.insert(name.to_string());
                         return false;
                     }
                     // Remove `{ workspace = true }` references to path deps
@@ -160,12 +183,52 @@ fn strip_path_deps_from_value(value: &mut toml::Value, workspace_path_dep_names:
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if is_workspace_ref && workspace_path_dep_names.contains(name) {
+                        removed.insert(name.to_string());
                         return false;
                     }
                     true
                 });
             }
         }
+    }
+    removed
+}
+
+/// Remove from the `[features]` table the entries that name a dependency in
+/// `removed`, keeping every feature (possibly empty).
+fn prune_features(value: &mut toml::Value, removed: &HashSet<String>) {
+    if removed.is_empty() {
+        return;
+    }
+    if let Some(features) = value.get_mut("features").and_then(|f| f.as_table_mut()) {
+        let feature_names: HashSet<String> = features.keys().cloned().collect();
+        for (_, entries) in features.iter_mut() {
+            if let Some(entries) = entries.as_array_mut() {
+                entries.retain(|entry| match entry.as_str() {
+                    Some(entry) => !names_removed_dependency(entry, removed, &feature_names),
+                    None => true,
+                });
+            }
+        }
+    }
+}
+
+/// Whether a feature entry refers to a removed dependency: `dep:name`,
+/// `name/feature` and `name?/feature` always do; a plain `name` does unless it
+/// is also the name of a feature, which is what a plain entry then refers to.
+fn names_removed_dependency(
+    entry: &str,
+    removed: &HashSet<String>,
+    feature_names: &HashSet<String>,
+) -> bool {
+    if let Some(dependency) = entry.strip_prefix("dep:") {
+        return removed.contains(dependency);
+    }
+    match entry.split_once('/') {
+        Some((dependency, _)) => {
+            removed.contains(dependency.strip_suffix('?').unwrap_or(dependency))
+        }
+        None => removed.contains(entry) && !feature_names.contains(entry),
     }
 }
 
@@ -475,6 +538,229 @@ path = "../util"
         assert!(
             result.is_err(),
             "expected Err when manifest has invalid TOML, got Ok"
+        );
+    }
+
+    /// The features of a stripped manifest, as a map of feature name to entries.
+    fn features_of(contents: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+        let value: toml::Value =
+            toml::from_str(contents).expect("stripped manifest must be valid TOML");
+        value
+            .get("features")
+            .and_then(|f| f.as_table())
+            .map(|table| {
+                table
+                    .iter()
+                    .map(|(name, entries)| {
+                        let entries = entries
+                            .as_array()
+                            .expect("a feature is an array")
+                            .iter()
+                            .map(|e| e.as_str().expect("a feature entry is a string").to_string())
+                            .collect();
+                        (name.clone(), entries)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn prunes_dep_syntax_feature_entry_of_a_stripped_optional_path_dep() {
+        // `testing = ["dep:internal"]` with `internal` an optional path dep:
+        // without pruning, cargo rejects the stripped manifest because the
+        // feature names a dependency that is no longer listed.
+        let original = r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[features]
+default = []
+testing = ["dep:internal"]
+
+[dependencies]
+anyhow = "1"
+
+[dependencies.internal]
+path = "../internal"
+version = "0.0.1"
+optional = true
+"#;
+        let result = strip_from_manifest_contents(original, &HashSet::new()).expect("strip failed");
+        let features = features_of(&result);
+        assert_eq!(
+            features.get("testing"),
+            Some(&Vec::<String>::new()),
+            "the feature stays, without the stripped dependency:\n{}",
+            result
+        );
+        assert!(
+            features.contains_key("default"),
+            "other features are kept:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn prunes_implicit_feature_entry_of_a_stripped_optional_path_dep() {
+        let original = r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[features]
+testing = ["internal"]
+
+[dependencies.internal]
+path = "../internal"
+optional = true
+"#;
+        let result = strip_from_manifest_contents(original, &HashSet::new()).expect("strip failed");
+        assert_eq!(
+            features_of(&result).get("testing"),
+            Some(&Vec::<String>::new()),
+            "{}",
+            result
+        );
+    }
+
+    #[test]
+    fn prunes_dependency_feature_entries_of_a_stripped_path_dep() {
+        // `internal/testing` and `internal?/testing` enable a feature of the
+        // stripped dependency; `serde/derive` belongs to a kept dependency.
+        let original = r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[features]
+testing = ["internal/testing", "internal?/testing", "serde/derive", "dep:serde"]
+
+[dependencies]
+serde = { version = "1", optional = true }
+
+[dependencies.internal]
+path = "../internal"
+optional = true
+"#;
+        let result = strip_from_manifest_contents(original, &HashSet::new()).expect("strip failed");
+        assert_eq!(
+            features_of(&result).get("testing"),
+            Some(&vec!["serde/derive".to_string(), "dep:serde".to_string()]),
+            "{}",
+            result
+        );
+    }
+
+    #[test]
+    fn keeps_feature_entries_that_name_kept_dependencies() {
+        let original = r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[features]
+testing = ["dep:mockall", "other-feature", "serde/derive"]
+other-feature = []
+
+[dependencies]
+mockall = { version = "0", optional = true }
+serde = "1"
+"#;
+        let result = strip_from_manifest_contents(original, &HashSet::new()).expect("strip failed");
+        assert_eq!(
+            features_of(&result).get("testing"),
+            Some(&vec![
+                "dep:mockall".to_string(),
+                "other-feature".to_string(),
+                "serde/derive".to_string()
+            ]),
+            "{}",
+            result
+        );
+    }
+
+    #[test]
+    fn prunes_feature_entries_of_a_stripped_workspace_inherited_dep() {
+        let member = r#"
+[package]
+name = "member"
+version = "0.1.0"
+
+[features]
+testing = ["dep:internal"]
+
+[dependencies]
+serde = { workspace = true }
+
+[dependencies.internal]
+workspace = true
+optional = true
+"#;
+        let ws_path_names: HashSet<String> = ["internal".to_string()].into();
+        let result = strip_from_manifest_contents(member, &ws_path_names).expect("strip failed");
+        assert_eq!(
+            features_of(&result).get("testing"),
+            Some(&Vec::<String>::new()),
+            "{}",
+            result
+        );
+    }
+
+    #[test]
+    fn prunes_feature_entries_of_a_stripped_target_specific_path_dep() {
+        let original = r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[features]
+testing = ["dep:internal"]
+
+[target.'cfg(unix)'.dependencies.internal]
+path = "../internal"
+optional = true
+"#;
+        let result = strip_from_manifest_contents(original, &HashSet::new()).expect("strip failed");
+        assert_eq!(
+            features_of(&result).get("testing"),
+            Some(&Vec::<String>::new()),
+            "{}",
+            result
+        );
+    }
+
+    #[test]
+    fn keeps_a_plain_feature_entry_that_names_an_existing_feature() {
+        // `internal` is both an explicit feature and the name of a stripped
+        // dependency: a plain entry then refers to the feature, which is kept.
+        let original = r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[features]
+internal = ["dep:internal"]
+testing = ["internal"]
+
+[dependencies.internal]
+path = "../internal"
+optional = true
+"#;
+        let result = strip_from_manifest_contents(original, &HashSet::new()).expect("strip failed");
+        let features = features_of(&result);
+        assert_eq!(
+            features.get("internal"),
+            Some(&Vec::<String>::new()),
+            "{}",
+            result
+        );
+        assert_eq!(
+            features.get("testing"),
+            Some(&vec!["internal".to_string()]),
+            "{}",
+            result
         );
     }
 }

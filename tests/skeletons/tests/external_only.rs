@@ -310,3 +310,82 @@ version = "1"
         );
     }
 }
+
+#[test]
+fn external_only_prunes_features_that_name_stripped_path_deps() {
+    // Arrange: the shape of a package that gates test support behind a
+    // `testing` feature whose optional dependency is a workspace path dep.
+    // Stripping the path dep must not leave a feature that names it, or cargo
+    // rejects the skeleton manifest ("feature `testing` includes
+    // `dep:model`, but `model` is not listed as a dependency").
+    let project = CargoWorkspace::new()
+        .manifest(
+            ".",
+            r#"
+[workspace]
+members = ["app", "model"]
+"#,
+        )
+        .lib_package(
+            "app",
+            r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+testing = ["dep:model", "model/extra"]
+
+[dependencies]
+anyhow = "1"
+
+[dependencies.model]
+path = "../model"
+version = "0.1.0"
+optional = true
+"#,
+        )
+        .lib_package(
+            "model",
+            r#"
+[package]
+name = "model"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+extra = []
+"#,
+        )
+        .touch("Cargo.lock")
+        .build();
+
+    // Act
+    let mut skeleton = Skeleton::derive(project.path(), None).unwrap();
+    skeleton.strip_path_deps().unwrap();
+
+    // Assert: the feature stays, empty, and the manifest is valid TOML.
+    let app_manifest = skeleton
+        .manifests
+        .iter()
+        .find(|m| m.relative_path.ends_with("app/Cargo.toml"))
+        .expect("app/Cargo.toml should be present");
+    let value: toml::Value =
+        toml::from_str(&app_manifest.contents).expect("stripped manifest must be valid TOML");
+    let testing = value["features"]["testing"]
+        .as_array()
+        .expect("the testing feature should be kept");
+    assert!(
+        testing.is_empty(),
+        "the testing feature should not name the stripped dependency, got {:?}:\n{}",
+        testing,
+        app_manifest.contents,
+    );
+    assert!(
+        app_manifest.contents.contains("anyhow"),
+        "external dep should be kept:\n{}",
+        app_manifest.contents,
+    );
+}

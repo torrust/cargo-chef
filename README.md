@@ -100,6 +100,10 @@ Nothing too mysterious going on here, you can examine the `recipe.json` file: it
 Generate a recipe that excludes all `path = "..."` dependency entries, producing a
 stable recipe that only changes when an external (crates.io) dependency changes.
 
+The `[features]` entries that name a removed dependency (`dep:name`, `name`, `name/feature`,
+`name?/feature`) are removed too, so an optional workspace dependency behind a feature (for example
+`testing = ["dep:internal"]`) does not leave an invalid manifest behind; the feature itself is kept.
+
 Useful in large Cargo workspaces where internal manifest changes (adding/removing
 crates, renaming, restructuring) should not invalidate the compiled third-party
 dependency cache layer:
